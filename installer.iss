@@ -37,6 +37,7 @@ Name: "firewall"; Description: "Add Windows Firewall rule (required for network 
 
 [Files]
 Source: "dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "transition.mp4"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
@@ -84,5 +85,6 @@ begin
     Exec('setx', 'OBS_BRB_YT_API_KEY ""', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     Exec('setx', 'OBS_BRB_YT_CHANNEL_ID ""', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     Exec('setx', 'OBS_BRB_FILTER_MODE ""', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Exec('setx', 'OBS_BRB_USE_TRANSITION ""', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
 end;

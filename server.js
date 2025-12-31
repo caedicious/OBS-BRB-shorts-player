@@ -4,6 +4,49 @@ const { exec } = require("child_process");
 
 const app = express();
 const PORT = 3000;
+const VERSION = "1.1.0";
+const GITHUB_REPO = "caedicious/OBS-BRB-shorts-player";
+
+// Check for updates from GitHub
+let updateAvailable = null;
+
+function checkForUpdates() {
+  const url = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
+  
+  fetch(url)
+    .then(function(resp) { return resp.json(); })
+    .then(function(data) {
+      if (data.tag_name) {
+        const latestVersion = data.tag_name.replace(/^v/, '');
+        if (compareVersions(latestVersion, VERSION) > 0) {
+          updateAvailable = {
+            version: latestVersion,
+            url: data.html_url,
+            downloadUrl: data.assets && data.assets[0] ? data.assets[0].browser_download_url : data.html_url
+          };
+          console.log("");
+          console.log("  *** UPDATE AVAILABLE: v" + latestVersion + " ***");
+          console.log("  Download: " + updateAvailable.downloadUrl);
+          console.log("");
+        }
+      }
+    })
+    .catch(function(e) {
+      // Silently fail - don't break the app if GitHub is unreachable
+    });
+}
+
+function compareVersions(a, b) {
+  const partsA = a.split('.').map(Number);
+  const partsB = b.split('.').map(Number);
+  for (let i = 0; i < Math.max(partsA.length, partsB.length); i++) {
+    const numA = partsA[i] || 0;
+    const numB = partsB[i] || 0;
+    if (numA > numB) return 1;
+    if (numA < numB) return -1;
+  }
+  return 0;
+}
 
 // Get local IP address
 function getLocalIP() {
@@ -26,9 +69,10 @@ function loadConfig() {
   const apiKey = process.env.OBS_BRB_YT_API_KEY;
   const channelId = process.env.OBS_BRB_YT_CHANNEL_ID;
   const filterMode = process.env.OBS_BRB_FILTER_MODE || "hashtag";
+  const useTransition = process.env.OBS_BRB_USE_TRANSITION === "true";
   
   if (apiKey && channelId) {
-    return { apiKey, channelId, filterMode };
+    return { apiKey, channelId, filterMode, useTransition };
   }
   return null;
 }
@@ -40,6 +84,7 @@ function saveConfig(config) {
   process.env.OBS_BRB_YT_API_KEY = config.apiKey;
   process.env.OBS_BRB_YT_CHANNEL_ID = config.channelId;
   process.env.OBS_BRB_FILTER_MODE = config.filterMode || "hashtag";
+  process.env.OBS_BRB_USE_TRANSITION = config.useTransition ? "true" : "false";
   
   // Set persistent user environment variables (Windows)
   if (process.platform === "win32") {
@@ -48,10 +93,12 @@ function saveConfig(config) {
       const safeApiKey = config.apiKey.replace(/"/g, '');
       const safeChannelId = config.channelId.replace(/"/g, '');
       const safeFilterMode = (config.filterMode || "hashtag").replace(/"/g, '');
+      const safeUseTransition = config.useTransition ? "true" : "false";
       
       execSync(`setx OBS_BRB_YT_API_KEY "${safeApiKey}"`, { stdio: 'ignore' });
       execSync(`setx OBS_BRB_YT_CHANNEL_ID "${safeChannelId}"`, { stdio: 'ignore' });
       execSync(`setx OBS_BRB_FILTER_MODE "${safeFilterMode}"`, { stdio: 'ignore' });
+      execSync(`setx OBS_BRB_USE_TRANSITION "${safeUseTransition}"`, { stdio: 'ignore' });
     } catch (e) {
       console.error("Warning: Could not save to environment variables:", e.message);
     }
@@ -65,6 +112,7 @@ function clearConfig() {
   delete process.env.OBS_BRB_YT_API_KEY;
   delete process.env.OBS_BRB_YT_CHANNEL_ID;
   delete process.env.OBS_BRB_FILTER_MODE;
+  delete process.env.OBS_BRB_USE_TRANSITION;
   
   // Clear persistent environment variables (Windows)
   if (process.platform === "win32") {
@@ -72,6 +120,7 @@ function clearConfig() {
       execSync('setx OBS_BRB_YT_API_KEY ""', { stdio: 'ignore' });
       execSync('setx OBS_BRB_YT_CHANNEL_ID ""', { stdio: 'ignore' });
       execSync('setx OBS_BRB_FILTER_MODE ""', { stdio: 'ignore' });
+      execSync('setx OBS_BRB_USE_TRANSITION ""', { stdio: 'ignore' });
     } catch (e) {
       console.error("Warning: Could not clear environment variables:", e.message);
     }
@@ -109,6 +158,53 @@ const CACHE_MS = 6 * 60 * 60 * 1000; // 6 hours
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Serve transition video
+const fs = require("fs");
+app.get("/transition.mp4", (req, res) => {
+  // Try multiple paths (packaged vs development)
+  const possiblePaths = [
+    path.join(__dirname, "transition.mp4"),
+    path.join(process.cwd(), "transition.mp4"),
+    path.join(path.dirname(process.execPath), "transition.mp4")
+  ];
+  
+  let videoPath = null;
+  for (const p of possiblePaths) {
+    if (fs.existsSync(p)) {
+      videoPath = p;
+      break;
+    }
+  }
+  
+  if (!videoPath) {
+    return res.status(404).send("Transition video not found");
+  }
+  
+  const stat = fs.statSync(videoPath);
+  const range = req.headers.range;
+  
+  if (range) {
+    const parts = range.replace(/bytes=/, "").split("-");
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
+    const chunksize = end - start + 1;
+    const file = fs.createReadStream(videoPath, { start, end });
+    res.writeHead(206, {
+      "Content-Range": `bytes ${start}-${end}/${stat.size}`,
+      "Accept-Ranges": "bytes",
+      "Content-Length": chunksize,
+      "Content-Type": "video/mp4"
+    });
+    file.pipe(res);
+  } else {
+    res.writeHead(200, {
+      "Content-Length": stat.size,
+      "Content-Type": "video/mp4"
+    });
+    fs.createReadStream(videoPath).pipe(res);
+  }
+});
 
 // ====== SETUP WIZARD ======
 const setupHtml = `<!DOCTYPE html>
@@ -250,6 +346,31 @@ const setupHtml = `<!DOCTYPE html>
     .error.show {
       display: block;
     }
+    .update-banner {
+      background: linear-gradient(135deg, rgba(74, 222, 128, 0.2), rgba(34, 197, 94, 0.2));
+      border: 2px solid #4ade80;
+      color: #4ade80;
+      padding: 12px 16px;
+      border-radius: 8px;
+      margin-bottom: 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .update-banner a {
+      background: #4ade80;
+      color: #1a1a2e;
+      padding: 6px 14px;
+      border-radius: 6px;
+      text-decoration: none;
+      font-weight: 600;
+      font-size: 14px;
+    }
+    .update-banner a:hover {
+      background: #22c55e;
+    }
     .toggle-group {
       display: flex;
       flex-direction: column;
@@ -274,7 +395,14 @@ const setupHtml = `<!DOCTYPE html>
       margin-top: 3px;
       accent-color: #feca57;
     }
-    .toggle-option input[type="radio"]:checked + .toggle-label strong {
+    .toggle-option input[type="checkbox"] {
+      margin-top: 3px;
+      accent-color: #feca57;
+      width: 18px;
+      height: 18px;
+    }
+    .toggle-option input[type="radio"]:checked + .toggle-label strong,
+    .toggle-option input[type="checkbox"]:checked + .toggle-label strong {
       color: #feca57;
     }
     .toggle-option:has(input:checked) {
@@ -321,6 +449,11 @@ const setupHtml = `<!DOCTYPE html>
 </head>
 <body>
   <div class="container">
+    <div id="update-banner" class="update-banner" style="display:none;">
+      <span>🎉 <strong>Update available!</strong> Version <span id="update-version"></span> is ready.</span>
+      <a id="update-link" href="#" target="_blank">Download now</a>
+    </div>
+    
     <h1>🎬 OBS BRB Shorts</h1>
     <p class="subtitle">Let's get you set up in just a few minutes. After setup, check the <a href="/obs-guide" style="color:#feca57">OBS Setup Guide</a>.</p>
 
@@ -393,6 +526,19 @@ const setupHtml = `<!DOCTYPE html>
         </div>
       </div>
 
+      <div class="form-group">
+        <label>Transition effect</label>
+        <div class="toggle-group">
+          <label class="toggle-option">
+            <input type="checkbox" name="useTransition" id="useTransition">
+            <span class="toggle-label">
+              <strong>TV Static transition</strong>
+              <small>Play a brief static effect between each Short</small>
+            </span>
+          </label>
+        </div>
+      </div>
+
       <button type="submit">Save & Continue →</button>
     </form>
   </div>
@@ -411,6 +557,7 @@ const setupHtml = `<!DOCTYPE html>
       const apiKey = document.getElementById('apiKey').value.trim();
       const channelId = document.getElementById('channelId').value.trim();
       const filterMode = document.querySelector('input[name="filterMode"]:checked').value;
+      const useTransition = document.getElementById('useTransition').checked;
 
       if (!apiKey || !channelId) {
         errorEl.textContent = 'Please fill in both fields.';
@@ -428,7 +575,7 @@ const setupHtml = `<!DOCTYPE html>
         const resp = await fetch('/api/setup', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ apiKey, channelId, filterMode })
+          body: JSON.stringify({ apiKey, channelId, filterMode, useTransition })
         });
 
         const data = await resp.json();
@@ -444,6 +591,18 @@ const setupHtml = `<!DOCTYPE html>
         errorEl.classList.add('show');
       }
     });
+    
+    // Check for updates
+    fetch('/api/version')
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (data.updateAvailable) {
+          document.getElementById('update-version').textContent = 'v' + data.updateAvailable.version;
+          document.getElementById('update-link').href = data.updateAvailable.downloadUrl;
+          document.getElementById('update-banner').style.display = 'flex';
+        }
+      })
+      .catch(function() {});
   </script>
 </body>
 </html>`;
@@ -467,7 +626,7 @@ app.get("/setup", (req, res) => {
 
 // Setup API
 app.post("/api/setup", async (req, res) => {
-  const { apiKey, channelId, filterMode } = req.body;
+  const { apiKey, channelId, filterMode, useTransition } = req.body;
 
   if (!apiKey || !channelId) {
     return res.json({ success: false, error: "Missing API key or Channel ID" });
@@ -494,11 +653,12 @@ app.post("/api/setup", async (req, res) => {
       });
     }
 
-    // Save config with filter mode (default to hashtag if not provided)
+    // Save config with filter mode and transition setting
     saveConfig({ 
       apiKey, 
       channelId, 
-      filterMode: filterMode || "hashtag" 
+      filterMode: filterMode || "hashtag",
+      useTransition: useTransition || false
     });
 
     // Clear cache so it fetches fresh
@@ -518,7 +678,8 @@ app.get("/api/config", (req, res) => {
       configured: true,
       channelId: config.channelId,
       apiKeySet: !!config.apiKey,
-      filterMode: config.filterMode || "hashtag"
+      filterMode: config.filterMode || "hashtag",
+      useTransition: config.useTransition || false
     });
   } else {
     res.json({ configured: false });
@@ -534,6 +695,14 @@ app.post("/api/clear-config", (req, res) => {
   } catch (e) {
     res.json({ success: false, error: e.message });
   }
+});
+
+// Check for updates
+app.get("/api/version", (req, res) => {
+  res.json({
+    current: VERSION,
+    updateAvailable: updateAvailable
+  });
 });
 
 // Shorts API
@@ -1086,6 +1255,7 @@ app.get("/obs-guide", (req, res) => {
 app.get("/settings", (req, res) => {
   const config = loadConfig();
   const currentFilterMode = (config && config.filterMode) || "hashtag";
+  const currentUseTransition = config && config.useTransition;
   
   // Add a "Clear Config" section for settings page
   const clearConfigSection = `
@@ -1141,11 +1311,20 @@ app.get("/settings", (req, res) => {
       .replace('value="duration">', 'value="duration" checked>');
   }
   
+  // Pre-check the transition checkbox if enabled
+  if (currentUseTransition) {
+    settingsHtml = settingsHtml
+      .replace('name="useTransition" id="useTransition">', 'name="useTransition" id="useTransition" checked>');
+  }
+  
   res.type("html").send(settingsHtml);
 });
 
 app.listen(PORT, "0.0.0.0", () => {
   const localIP = getLocalIP();
+  
+  // Check for updates on startup
+  checkForUpdates();
   
   console.log("");
   console.log("==========================================================");
@@ -1199,6 +1378,16 @@ const playerHtml = `<!doctype html>
   <style>
     html, body { margin:0; padding:0; width:100%; height:100%; background:black; overflow:hidden; }
     #player { width:100%; height:100%; }
+    #transition-video {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      z-index: 100;
+      display: none;
+    }
     #status {
       position: fixed;
       top: 10px;
@@ -1246,12 +1435,33 @@ const playerHtml = `<!doctype html>
       z-index: 1000;
     }
     body:hover #guide-btn { opacity: 1; }
+    #update-btn {
+      position: fixed;
+      top: 10px;
+      right: 200px;
+      background: linear-gradient(135deg, #4ade80, #22c55e);
+      border: none;
+      color: #1a1a2e;
+      padding: 8px 12px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 600;
+      opacity: 0;
+      transition: opacity 0.3s;
+      z-index: 1000;
+      display: none;
+    }
+    body:hover #update-btn { opacity: 1; }
+    #update-btn.show { display: block; }
   </style>
 </head>
 <body>
   <div id="status"></div>
+  <a id="update-btn" href="#" target="_blank">🎉 Update Available</a>
   <button id="guide-btn" onclick="location.href='/obs-guide'">📺 OBS Guide</button>
   <button id="settings-btn" onclick="location.href='/settings'">⚙️ Settings</button>
+  <video id="transition-video" src="/transition.mp4" playsinline></video>
   <div id="player"></div>
 
   <script src="https://www.youtube.com/iframe_api"></script>
@@ -1261,6 +1471,8 @@ const playerHtml = `<!doctype html>
     let index = 0;
     let player = null;
     let pausedByHidden = false;
+    let useTransition = false;
+    let transitionVideo = null;
 
     const statusEl = document.getElementById('status');
     function showStatus(msg, duration) {
@@ -1280,6 +1492,22 @@ const playerHtml = `<!doctype html>
       return arr;
     }
 
+    function loadConfig() {
+      return fetch("/api/config")
+        .then(function(resp) { return resp.json(); })
+        .then(function(json) {
+          useTransition = json.useTransition || false;
+          if (useTransition) {
+            transitionVideo = document.getElementById('transition-video');
+            // Preload the video
+            transitionVideo.load();
+          }
+        })
+        .catch(function() {
+          useTransition = false;
+        });
+    }
+
     function loadIds() {
       return fetch("/api/shorts")
         .then(function(resp) { return resp.json(); })
@@ -1291,7 +1519,7 @@ const playerHtml = `<!doctype html>
           ids = json.ids || [];
           queue = shuffle(ids.slice());
           index = 0;
-          showStatus("Loaded " + ids.length + " shorts" + (json.cached ? " (cached)" : ""));
+          showStatus("Loaded " + ids.length + " shorts" + (json.cached ? " (cached)" : "") + (useTransition ? " + transitions" : ""));
         })
         .catch(function() {
           showStatus("Failed to load shorts", 5000);
@@ -1308,6 +1536,28 @@ const playerHtml = `<!doctype html>
       return id;
     }
 
+    function playTransitionThenNext() {
+      if (!useTransition || !transitionVideo) {
+        playNext();
+        return;
+      }
+      
+      // Show and play transition
+      transitionVideo.style.display = 'block';
+      transitionVideo.currentTime = 0;
+      transitionVideo.play().then(function() {
+        // When transition ends, hide it and play next short
+        transitionVideo.onended = function() {
+          transitionVideo.style.display = 'none';
+          playNext();
+        };
+      }).catch(function() {
+        // If transition fails, just play next
+        transitionVideo.style.display = 'none';
+        playNext();
+      });
+    }
+
     function playNext() {
       const id = nextId();
       if (!id || !player) return;
@@ -1316,14 +1566,20 @@ const playerHtml = `<!doctype html>
 
     function tryUnmuteAndPlay() {
       if (!player) return;
-      try { player.unMute(); } catch(e) {}
-      try { player.setVolume(100); } catch(e) {}
-      try { player.playVideo(); } catch(e) {}
+      try {
+        if (player.isMuted()) {
+          player.unMute();
+          player.setVolume(100);
+        }
+        player.playVideo();
+      } catch(e) {}
     }
 
     window.onYouTubeIframeAPIReady = function() {
-      showStatus("Loading shorts...");
-      loadIds().then(function() {
+      showStatus("Loading...");
+      loadConfig().then(function() {
+        return loadIds();
+      }).then(function() {
         if (!ids.length) {
           showStatus("No shorts found! Check settings.", 10000);
           return;
@@ -1345,17 +1601,37 @@ const playerHtml = `<!doctype html>
           },
           events: {
             onReady: function() {
-              playNext();
-              setTimeout(function() {
-                tryUnmuteAndPlay();
-              }, 600);
-
-              setInterval(function() {
-                if (!document.hidden) tryUnmuteAndPlay();
-              }, 3000);
+              // Play transition first if enabled, then first Short
+              if (useTransition && transitionVideo) {
+                transitionVideo.style.display = 'block';
+                transitionVideo.currentTime = 0;
+                transitionVideo.play().then(function() {
+                  transitionVideo.onended = function() {
+                    transitionVideo.style.display = 'none';
+                    playNext();
+                  };
+                }).catch(function() {
+                  transitionVideo.style.display = 'none';
+                  playNext();
+                });
+              } else {
+                playNext();
+              }
             },
             onStateChange: function(e) {
-              if (e.data === YT.PlayerState.ENDED) playNext();
+              // When video starts playing for the first time, unmute and restart from beginning
+              if (e.data === YT.PlayerState.PLAYING) {
+                try {
+                  if (player.isMuted()) {
+                    player.unMute();
+                    player.setVolume(100);
+                    player.seekTo(0, true);
+                  }
+                } catch(err) {}
+              }
+              if (e.data === YT.PlayerState.ENDED) {
+                playTransitionThenNext();
+              }
             },
             onError: function(e) {
               console.log("Player error:", e.data);
@@ -1371,6 +1647,9 @@ const playerHtml = `<!doctype html>
       if (document.hidden) {
         pausedByHidden = true;
         try { player.pauseVideo(); } catch(e) {}
+        if (transitionVideo) {
+          try { transitionVideo.pause(); } catch(e) {}
+        }
       } else if (pausedByHidden) {
         pausedByHidden = false;
         tryUnmuteAndPlay();
@@ -1381,6 +1660,19 @@ const playerHtml = `<!doctype html>
     setInterval(function() {
       loadIds().catch(function() {});
     }, 60 * 60 * 1000);
+    
+    // Check for updates
+    fetch('/api/version')
+      .then(function(r) { return r.json(); })
+      .then(function(data) {
+        if (data.updateAvailable) {
+          var btn = document.getElementById('update-btn');
+          btn.href = data.updateAvailable.downloadUrl;
+          btn.textContent = '🎉 Update v' + data.updateAvailable.version;
+          btn.classList.add('show');
+        }
+      })
+      .catch(function() {});
   </script>
 </body>
 </html>`;

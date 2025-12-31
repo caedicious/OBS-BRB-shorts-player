@@ -9,7 +9,7 @@
     "build": "pkg . --targets node18-win-x64 --output dist/OBS-BRB-Shorts.exe"
   },
   "pkg": {
-    "assets": [],
+    "assets": ["transition.mp4"],
     "outputPath": "dist"
   },
   "keywords": ["obs", "youtube", "shorts", "brb", "streaming"],
