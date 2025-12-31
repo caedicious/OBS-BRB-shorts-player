@@ -1,0 +1,24 @@
+{
+  "name": "obs-brb-shorts",
+  "version": "1.0.0",
+  "description": "Play YouTube Shorts during OBS BRB scenes",
+  "main": "server.js",
+  "bin": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "build": "pkg . --targets node18-win-x64 --output dist/OBS-BRB-Shorts.exe"
+  },
+  "pkg": {
+    "assets": [],
+    "outputPath": "dist"
+  },
+  "keywords": ["obs", "youtube", "shorts", "brb", "streaming"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.21.0"
+  },
+  "devDependencies": {
+    "pkg": "^5.8.1"
+  }
+}

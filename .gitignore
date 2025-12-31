@@ -1,0 +1,6 @@
+node_modules/
+dist/
+installer/
+*.log
+.env
+config.json
