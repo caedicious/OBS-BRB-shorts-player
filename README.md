@@ -2,6 +2,11 @@
 
 A simple, local app that plays YouTube Shorts in shuffle/loop mode — perfect for OBS "Be Right Back" scenes.
 
+[![Release](https://img.shields.io/github/v/release/caedicious/OBS-BRB-shorts-player?include_prereleases)](https://github.com/caedicious/OBS-BRB-shorts-player/releases/)
+[![Downloads](https://img.shields.io/github/downloads/caedicious/OBS-BRB-shorts-player/total)](https://github.com/caedicious/OBS-BRB-shorts-player/releases)
+[![License](https://img.shields.io/github/license/caedicious/OBS-BRB-shorts-player)](LICENSE.txt)
+![Platform](https://img.shields.io/badge/platform-Windows-blue)
+
 ## Features
 
 - 🎬 Plays all Shorts from any YouTube channel
