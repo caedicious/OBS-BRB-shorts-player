@@ -16,13 +16,14 @@ A simple, local app that plays YouTube Shorts in shuffle/loop mode — perfect f
 - 🌐 Network accessible (use on any device)
 - 🧙 First-run setup wizard (no terminal required)
 - 📦 Single executable (no Node.js needed for end users)
+- ⬆️ Offers new versions when it starts and installs them for you
 
 ## For End Users
 
 ### Installation
 
 1. Download `OBS-BRB-Shorts-Setup.exe` from Releases
-2. Run the installer
+2. Run the installer. The installer isn't code-signed yet, so Windows SmartScreen may warn you: click **More info**, then **Run anyway**
 3. Launch "OBS BRB Shorts" from Start Menu
 4. Follow the setup wizard to enter your YouTube API key and Channel ID
 5. Add `http://localhost:3000/player` as an OBS Browser Source
@@ -35,6 +36,12 @@ A simple, local app that plays YouTube Shorts in shuffle/loop mode — perfect f
 4. ✅ Check "Control audio via OBS"
 5. ✅ Check "Shutdown source when not visible"
 6. Optionally: "Refresh browser when scene becomes active"
+
+### Updates
+
+When a new version is out, the app asks when it starts: **Install new update** or **Not right now**, with a **Do not remind me about this version** checkbox. Installing downloads the new installer from this repo's Releases, checks it, and installs it in the background. Windows asks for permission once, then the app restarts on its own. The prompt only appears when the app starts, never in the middle of a stream.
+
+Versions older than 1.1.1 can't update themselves: install 1.1.1 once from Releases and it handles updates from then on.
 
 ### Getting a YouTube API Key
 
@@ -65,8 +72,8 @@ Your Channel ID starts with `UC` and is 24 characters long.
 
 ```bash
 # Clone the repo
-git clone https://github.com/yourusername/obs-brb-shorts.git
-cd obs-brb-shorts
+git clone https://github.com/caedicious/OBS-BRB-shorts-player.git
+cd OBS-BRB-shorts-player
 
 # Install dependencies
 npm install
@@ -98,10 +105,17 @@ pkg . --targets node18-win-x64 --output dist/OBS-BRB-Shorts.exe
 ### Building the Installer
 
 1. Install [Inno Setup 6](https://jrsoftware.org/isdl.php)
-2. Create an `icon.ico` file (256x256 recommended) or remove `SetupIconFile` from `installer.iss`
-3. Open `installer.iss` in Inno Setup Compiler
-4. Build → Compile
-5. Find `OBS-BRB-Shorts-Setup.exe` in the `installer/` folder
+2. Open `installer.iss` in Inno Setup Compiler and click Build → Compile, or from the command line:
+   `"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss`
+3. Find `OBS-BRB-Shorts-Setup.exe` in the `installer/` folder
+
+When releasing, bump `const VERSION` in `server.js` (the in-app update check compares it against the latest GitHub release tag) and `MyAppVersion` in `installer.iss`.
+
+The in-app updater relies on two things in every release:
+- The installer is attached as exactly `OBS-BRB-Shorts-Setup.exe`
+- Its SHA-256 is available: GitHub publishes a digest for each uploaded asset, which the updater checks. If that's ever missing, attach a `SHA256SUMS.txt` (`<sha256>  OBS-BRB-Shorts-Setup.exe`); with neither, the updater refuses to install
+
+Installed builds check GitHub at launch and install via `/VERYSILENT`, then restart the app. Dev runs (`npm start`) and exes run straight from `dist/` only print the notice. The download, `update.log` (the updater's steps) and `install.log` (Inno Setup's) live in `%LOCALAPPDATA%\OBS-BRB-Shorts\update`.
 
 ### Project Structure
 
@@ -124,6 +138,8 @@ User config is stored in **Windows User Environment Variables** (not plain text 
 - `OBS_BRB_YT_API_KEY` - YouTube Data API v3 key
 - `OBS_BRB_YT_CHANNEL_ID` - YouTube channel ID
 - `OBS_BRB_FILTER_MODE` - Filter mode ("hashtag" or "duration")
+- `OBS_BRB_USE_TRANSITION` - TV static transition between Shorts ("true" or "false")
+- `OBS_BRB_SKIP_UPDATE_VERSION` - The version the user asked not to be reminded about
 
 This is more secure than storing credentials in a plain text config file.
 
@@ -135,9 +151,15 @@ This is more secure than storing credentials in a plain text config file.
 | `GET /setup` | Setup wizard |
 | `GET /settings` | Reconfigure settings |
 | `GET /player` | The Shorts player |
-| `GET /api/shorts` | Returns shuffled Short IDs |
+| `GET /obs-guide` | Built-in OBS setup guide |
+| `GET /api/shorts` | Returns the channel's Short IDs (the player shuffles them) |
 | `GET /api/config` | Check config status |
+| `GET /api/version` | Current version and update info |
+| `GET /api/player-log` | What the player has been doing (paste this into bug reports) |
+| `GET /api/network-info` | Local IP address, for the guide page |
 | `POST /api/setup` | Save configuration |
+| `POST /api/clear-config` | Clear saved configuration |
+| `GET /transition.mp4` | TV static transition clip |
 
 ### Caching
 

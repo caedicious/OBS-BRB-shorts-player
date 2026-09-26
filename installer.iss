@@ -2,9 +2,9 @@
 ; Requires Inno Setup 6.x - https://jrsoftware.org/isinfo.php
 
 #define MyAppName "OBS BRB Shorts"
-#define MyAppVersion "1.0.0"
-#define MyAppPublisher "Your Name"
-#define MyAppURL "https://github.com/yourusername/obs-brb-shorts"
+#define MyAppVersion "1.1.1"
+#define MyAppPublisher "CaedVT"
+#define MyAppURL "https://github.com/caedicious/OBS-BRB-shorts-player"
 #define MyAppExeName "OBS-BRB-Shorts.exe"
 
 [Setup]
@@ -46,24 +46,27 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: startupicon
 
 [Run]
+; Silent installs come from the in-app updater, which restarts the app itself
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [Code]
+procedure RemoveFirewallRule();
+var
+  ResultCode: Integer;
+begin
+  Exec('netsh', 'advfirewall firewall delete rule name="OBS BRB Shorts"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
 procedure AddFirewallRule();
 var
   ResultCode: Integer;
 begin
   if IsTaskSelected('firewall') then
   begin
+    // Remove first so upgrades don't stack duplicate rules
+    RemoveFirewallRule();
     Exec('netsh', 'advfirewall firewall add rule name="OBS BRB Shorts" dir=in action=allow protocol=tcp localport=3000', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
-end;
-
-procedure RemoveFirewallRule();
-var
-  ResultCode: Integer;
-begin
-  Exec('netsh', 'advfirewall firewall delete rule name="OBS BRB Shorts"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -86,5 +89,6 @@ begin
     Exec('setx', 'OBS_BRB_YT_CHANNEL_ID ""', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     Exec('setx', 'OBS_BRB_FILTER_MODE ""', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     Exec('setx', 'OBS_BRB_USE_TRANSITION ""', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Exec('setx', 'OBS_BRB_SKIP_UPDATE_VERSION ""', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
 end;

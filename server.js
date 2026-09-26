@@ -4,41 +4,65 @@ const { exec } = require("child_process");
 
 const app = express();
 const PORT = 3000;
-const VERSION = "1.1.0";
+const VERSION = "1.1.1";
 const GITHUB_REPO = "caedicious/OBS-BRB-shorts-player";
 
 // Check for updates from GitHub
-let updateAvailable = null;
+const INSTALLER_ASSET = "OBS-BRB-Shorts-Setup.exe";
+let updateAvailable = null;   // summary for /api/version and the web banners
+let latestRelease = null;     // what the in-app installer needs
 
+// Resolves to the newer release, or null if there isn't one (or GitHub
+// is unreachable, which must never break the app)
 function checkForUpdates() {
   const url = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
-  
-  fetch(url)
+
+  return fetch(url)
     .then(function(resp) { return resp.json(); })
     .then(function(data) {
-      if (data.tag_name) {
-        const latestVersion = data.tag_name.replace(/^v/, '');
-        if (compareVersions(latestVersion, VERSION) > 0) {
-          updateAvailable = {
-            version: latestVersion,
-            url: data.html_url,
-            downloadUrl: data.assets && data.assets[0] ? data.assets[0].browser_download_url : data.html_url
-          };
-          console.log("");
-          console.log("  *** UPDATE AVAILABLE: v" + latestVersion + " ***");
-          console.log("  Download: " + updateAvailable.downloadUrl);
-          console.log("");
-        }
+      const latestVersion = String(data.tag_name || "").replace(/^v/, '');
+      if (!isVersionString(latestVersion) || compareVersions(latestVersion, VERSION) <= 0) {
+        return null;
       }
+      const assets = data.assets || [];
+      const installer = assets.find(function(a) { return a.name === INSTALLER_ASSET; }) || null;
+      const sums = assets.find(function(a) { return a.name === "SHA256SUMS.txt"; }) || null;
+      const firstNotice = !updateAvailable || updateAvailable.version !== latestVersion;
+      updateAvailable = {
+        version: latestVersion,
+        url: data.html_url,
+        downloadUrl: installer ? installer.browser_download_url : data.html_url
+      };
+      latestRelease = { version: latestVersion, installer: installer, sums: sums };
+      if (firstNotice) {
+        console.log("");
+        console.log("  *** UPDATE AVAILABLE: v" + latestVersion + " ***");
+        console.log("  Download: " + updateAvailable.downloadUrl);
+        console.log("");
+      }
+      return latestRelease;
     })
     .catch(function(e) {
-      // Silently fail - don't break the app if GitHub is unreachable
+      return null;
     });
 }
 
+function isVersionString(v) {
+  return /^\d+(\.\d+){1,3}([-+][0-9A-Za-z.-]+)?$/.test(v);
+}
+
+// Leading digits of each dot segment, so a tag like "1.2.0-beta" can't
+// become NaN and hide an update
+function versionParts(v) {
+  return String(v).split('.').map(function(p) {
+    const m = /^\d+/.exec(p);
+    return m ? Number(m[0]) : 0;
+  });
+}
+
 function compareVersions(a, b) {
-  const partsA = a.split('.').map(Number);
-  const partsB = b.split('.').map(Number);
+  const partsA = versionParts(a);
+  const partsB = versionParts(b);
   for (let i = 0; i < Math.max(partsA.length, partsB.length); i++) {
     const numA = partsA[i] || 0;
     const numB = partsB[i] || 0;
@@ -48,18 +72,39 @@ function compareVersions(a, b) {
   return 0;
 }
 
-// Get local IP address
-function getLocalIP() {
+// This PC's IPv4 addresses, most likely LAN address first. Home LAN ranges
+// win; VPN (Tailscale's 100.x), Hyper-V/WSL/VM adapters and link-local
+// addresses are pushed down, because a browser source on another PC in
+// the room can't usually reach those.
+function getLocalIPs() {
   const os = require("os");
   const interfaces = os.networkInterfaces();
+  const found = [];
   for (const name of Object.keys(interfaces)) {
     for (const iface of interfaces[name]) {
-      if (iface.family === "IPv4" && !iface.internal) {
-        return iface.address;
+      if ((iface.family === "IPv4" || iface.family === 4) && !iface.internal) {
+        found.push({ address: iface.address, score: rankAddress(name, iface.address) });
       }
     }
   }
-  return "YOUR_IP";
+  found.sort((a, b) => b.score - a.score);
+  return found.map((f) => f.address);
+}
+
+function rankAddress(name, address) {
+  let score;
+  if (/^192\.168\./.test(address)) score = 40;
+  else if (/^10\./.test(address)) score = 30;
+  else if (/^172\.(1[6-9]|2\d|3[01])\./.test(address)) score = 20;
+  else if (/^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(address)) score = 5;   // Tailscale, carrier NAT
+  else if (/^169\.254\./.test(address)) score = -10;                              // no DHCP lease
+  else score = 10;
+  if (/vethernet|hyper-v|wsl|vmware|virtualbox|vbox|docker|tailscale|zerotier|hamachi|radmin|tunnel|loopback/i.test(name)) score -= 15;
+  return score;
+}
+
+function getLocalIP() {
+  return getLocalIPs()[0] || "YOUR_IP";
 }
 
 // Config via environment variables (more secure than plain text file)
@@ -113,7 +158,8 @@ function clearConfig() {
   delete process.env.OBS_BRB_YT_CHANNEL_ID;
   delete process.env.OBS_BRB_FILTER_MODE;
   delete process.env.OBS_BRB_USE_TRANSITION;
-  
+  delete process.env.OBS_BRB_SKIP_UPDATE_VERSION;
+
   // Clear persistent environment variables (Windows)
   if (process.platform === "win32") {
     try {
@@ -121,6 +167,7 @@ function clearConfig() {
       execSync('setx OBS_BRB_YT_CHANNEL_ID ""', { stdio: 'ignore' });
       execSync('setx OBS_BRB_FILTER_MODE ""', { stdio: 'ignore' });
       execSync('setx OBS_BRB_USE_TRANSITION ""', { stdio: 'ignore' });
+      execSync('setx OBS_BRB_SKIP_UPDATE_VERSION ""', { stdio: 'ignore' });
     } catch (e) {
       console.error("Warning: Could not clear environment variables:", e.message);
     }
@@ -135,10 +182,14 @@ function fetch(url) {
   return new Promise((resolve, reject) => {
     const parsedUrl = new URL(url);
     const client = parsedUrl.protocol === "https:" ? https : http;
-    
-    const req = client.get(url, (res) => {
+
+    // GitHub's API rejects requests with no User-Agent (403), which silently
+    // broke the update check in 1.1.0
+    const options = { headers: { "User-Agent": "OBS-BRB-Shorts/" + VERSION } };
+    const req = client.get(url, options, (res) => {
       let data = "";
       res.on("data", (chunk) => (data += chunk));
+      res.on("error", reject);
       res.on("end", () => {
         resolve({
           ok: res.statusCode >= 200 && res.statusCode < 300,
@@ -148,6 +199,8 @@ function fetch(url) {
         });
       });
     });
+    // Never hang forever on a stalled connection
+    req.setTimeout(15000, () => req.destroy(new Error("Request timed out")));
     req.on("error", reject);
   });
 }
@@ -205,6 +258,381 @@ app.get("/transition.mp4", (req, res) => {
     fs.createReadStream(videoPath).pipe(res);
   }
 });
+
+// ====== IN-APP UPDATE ======
+// At launch, a newer GitHub release is offered in a small dialog:
+// "Install new update" / "Not right now", plus "Do not remind me about this
+// version" (remembered per version in OBS_BRB_SKIP_UPDATE_VERSION).
+// Installing downloads the release's installer, checks its SHA-256, and
+// hands off to a detached script that waits for this app to exit, installs
+// silently, and starts the app again. Nothing changes unless the download
+// verifies. Same flow as Stream Monitor's updater.
+const crypto = require("crypto");
+const childProcess = require("child_process");
+const { pipeline, Transform } = require("stream");
+
+const UPDATE_DIR = path.join(process.env.LOCALAPPDATA || require("os").tmpdir(), "OBS-BRB-Shorts", "update");
+const UPDATE_RESULT_FILE = path.join(UPDATE_DIR, "result.txt");
+const POWERSHELL = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+
+// Only an installed, packaged build can replace itself. Dev runs
+// (node server.js) and copies run from dist/ just print the notice.
+function canSelfUpdate() {
+  if (process.platform !== "win32" || !process.pkg) return false;
+  try {
+    return fs.readdirSync(path.dirname(process.execPath)).some(function(f) {
+      return /^unins\d+\.exe$/i.test(f);
+    });
+  } catch (e) {
+    return false;
+  }
+}
+
+function setUserEnv(name, value) {
+  process.env[name] = value;
+  if (process.platform !== "win32") return;
+  try {
+    childProcess.execSync('setx ' + name + ' "' + String(value).replace(/"/g, '') + '"', { stdio: 'ignore' });
+  } catch (e) {
+    console.error("Warning: Could not save " + name + ":", e.message);
+  }
+}
+
+// The prompt, as a WinForms dialog run by Windows PowerShell. The versions
+// reach it through environment variables, so nothing from GitHub is ever
+// parsed as code. It must not contain double quotes (it's passed as one
+// command-line argument). Exit codes: 10 install, 11 not right now,
+// 12 not right now + don't remind me about this version.
+const UPDATE_DIALOG_SCRIPT = "try { " + [
+  "Add-Type -AssemblyName System.Windows.Forms",
+  "Add-Type -AssemblyName System.Drawing",
+  "[System.Windows.Forms.Application]::EnableVisualStyles()",
+  "$f = New-Object System.Windows.Forms.Form",
+  "$f.Text = 'OBS BRB Shorts Update'",
+  "$f.FormBorderStyle = 'FixedDialog'",
+  "$f.MaximizeBox = $false",
+  "$f.MinimizeBox = $false",
+  "$f.ShowIcon = $false",
+  "$f.StartPosition = 'CenterScreen'",
+  "$f.TopMost = $true",
+  "$f.AutoScaleMode = 'Dpi'",
+  "$f.AutoSize = $true",
+  "$f.AutoSizeMode = 'GrowAndShrink'",
+  "$f.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 9",
+  "$p = New-Object System.Windows.Forms.FlowLayoutPanel",
+  "$p.FlowDirection = 'TopDown'",
+  "$p.WrapContents = $false",
+  "$p.AutoSize = $true",
+  "$p.Padding = New-Object System.Windows.Forms.Padding -ArgumentList 14",
+  "$t = New-Object System.Windows.Forms.Label",
+  "$t.Text = 'New update available'",
+  "$t.AutoSize = $true",
+  "$t.Font = New-Object System.Drawing.Font -ArgumentList 'Segoe UI', 12, ([System.Drawing.FontStyle]::Bold)",
+  "$m = New-Object System.Windows.Forms.Label",
+  "$m.AutoSize = $true",
+  "$m.MaximumSize = New-Object System.Drawing.Size -ArgumentList 390, 0",
+  "$m.Margin = New-Object System.Windows.Forms.Padding -ArgumentList 3, 8, 3, 12",
+  "$m.Text = 'OBS BRB Shorts v' + $env:BRB_UPDATE_LATEST + ' is available (you have v' + $env:BRB_UPDATE_CURRENT + ').' + [Environment]::NewLine + [Environment]::NewLine + 'Would you like to install it? Windows will ask for permission, then the app restarts itself when it finishes.'",
+  "$c = New-Object System.Windows.Forms.CheckBox",
+  "$c.Text = 'Do not remind me about this version'",
+  "$c.AutoSize = $true",
+  "$b = New-Object System.Windows.Forms.FlowLayoutPanel",
+  "$b.FlowDirection = 'RightToLeft'",
+  "$b.AutoSize = $true",
+  "$b.MinimumSize = New-Object System.Drawing.Size -ArgumentList 390, 0",
+  "$b.Margin = New-Object System.Windows.Forms.Padding -ArgumentList 0, 14, 0, 0",
+  "$i = New-Object System.Windows.Forms.Button",
+  "$i.Text = 'Install new update'",
+  "$i.AutoSize = $true",
+  "$i.Padding = New-Object System.Windows.Forms.Padding -ArgumentList 6, 2, 6, 2",
+  "$n = New-Object System.Windows.Forms.Button",
+  "$n.Text = 'Not right now'",
+  "$n.AutoSize = $true",
+  "$n.Padding = New-Object System.Windows.Forms.Padding -ArgumentList 6, 2, 6, 2",
+  "$i.Add_Click({ $f.Tag = 'install'; $f.Close() })",
+  "$n.Add_Click({ $f.Close() })",
+  "$f.CancelButton = $n",
+  "$b.Controls.Add($i)",
+  "$b.Controls.Add($n)",
+  "$p.Controls.AddRange(@($t, $m, $c, $b))",
+  "$f.Controls.Add($p)",
+  "[void]$f.ShowDialog()",
+  "if ($f.Tag -eq 'install') { exit 10 } elseif ($c.Checked) { exit 12 } else { exit 11 }"
+].join("; ") + " } catch { exit 1 }";
+
+function showUpdateDialog(latestVersion, callback) {
+  let answered = false;
+  function answer(choice) {
+    if (answered) return;
+    answered = true;
+    callback(choice);
+  }
+  try {
+    // Shares this app's console, so no extra window appears and nothing gets hidden
+    const child = childProcess.spawn(POWERSHELL, ["-NoProfile", "-NonInteractive", "-Command", UPDATE_DIALOG_SCRIPT], {
+      env: Object.assign({}, process.env, { BRB_UPDATE_CURRENT: VERSION, BRB_UPDATE_LATEST: latestVersion }),
+      stdio: "ignore"
+    });
+    child.on("error", function() { answer(null); });
+    child.on("exit", function(code) {
+      answer(code === 10 ? "install" : code === 11 ? "later" : code === 12 ? "skip" : null);
+    });
+  } catch (e) {
+    answer(null);
+  }
+}
+
+// HTTPS GET from GitHub only, following its release-download redirects
+function githubGet(url, redirects) {
+  redirects = redirects || 0;
+  return new Promise(function(resolve, reject) {
+    let u;
+    try { u = new URL(url); } catch (e) { return reject(e); }
+    const trusted = u.protocol === "https:" &&
+      (u.hostname === "github.com" || u.hostname === "api.github.com" || /\.githubusercontent\.com$/.test(u.hostname));
+    if (!trusted) return reject(new Error("refusing to download from " + u.host));
+    const req = https.get(u, { headers: { "User-Agent": "OBS-BRB-Shorts/" + VERSION } }, function(res) {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        res.resume();
+        if (redirects >= 5) return reject(new Error("too many redirects"));
+        return resolve(githubGet(new URL(res.headers.location, u).toString(), redirects + 1));
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        return reject(new Error("HTTP " + res.statusCode));
+      }
+      resolve(res);
+    });
+    req.setTimeout(30000, function() { req.destroy(new Error("connection timed out")); });
+    req.on("error", reject);
+  });
+}
+
+// Streams a download to disk and resolves to its SHA-256 (hex)
+function downloadFile(url, dest) {
+  return githubGet(url).then(function(res) {
+    return new Promise(function(resolve, reject) {
+      const hash = crypto.createHash("sha256");
+      const tap = new Transform({
+        transform: function(chunk, enc, cb) { hash.update(chunk); cb(null, chunk); }
+      });
+      pipeline(res, tap, fs.createWriteStream(dest), function(err) {
+        if (err) reject(err); else resolve(hash.digest("hex"));
+      });
+    });
+  });
+}
+
+function fetchText(url) {
+  return githubGet(url).then(function(res) {
+    return new Promise(function(resolve, reject) {
+      const chunks = [];
+      res.on("data", function(c) { chunks.push(c); });
+      res.on("end", function() { resolve(Buffer.concat(chunks).toString("utf8")); });
+      res.on("error", reject);
+      res.on("close", function() { if (!res.complete) reject(new Error("download interrupted")); });
+    });
+  });
+}
+
+// Retries cover flaky connections and a just-published asset that GitHub
+// briefly 404s while it propagates
+function withRetry(what, fn) {
+  const attempts = 5;
+  function attempt(n) {
+    return fn().catch(function(err) {
+      if (n >= attempts) throw err;
+      const wait = Math.min(Math.pow(2, n - 1), 15);
+      console.log("  " + what + " failed (" + err.message + "), retrying in " + wait + "s...");
+      return new Promise(function(r) { setTimeout(r, wait * 1000); }).then(function() { return attempt(n + 1); });
+    });
+  }
+  return attempt(1);
+}
+
+// The installer's SHA-256: GitHub's own digest for the asset, or the
+// release's SHA256SUMS.txt when the digest is missing
+function expectedInstallerHash(release) {
+  const m = /^sha256:([0-9a-f]{64})$/i.exec((release.installer && release.installer.digest) || "");
+  if (m) return Promise.resolve(m[1].toLowerCase());
+  if (!release.sums) return Promise.resolve(null);
+  return withRetry("Checksum download", function() { return fetchText(release.sums.browser_download_url); })
+    .then(function(text) {
+      for (const line of text.split(/\r?\n/)) {
+        const parts = line.trim().split(/\s+/);
+        if (parts.length === 2 && /^[0-9a-f]{64}$/i.test(parts[0]) && parts[1].replace(/^\*/, '') === INSTALLER_ASSET) {
+          return parts[0].toLowerCase();
+        }
+      }
+      return null;
+    });
+}
+
+function prepareUpdateDir() {
+  fs.mkdirSync(UPDATE_DIR, { recursive: true });
+  for (const f of fs.readdirSync(UPDATE_DIR)) {
+    if (/^OBS-BRB-Shorts-Setup-.*\.exe$/i.test(f) || f === "apply-update.cmd" || f === "poll.json") {
+      try { fs.unlinkSync(path.join(UPDATE_DIR, f)); } catch (e) {}
+    }
+  }
+}
+
+// The updater, a Windows PowerShell script with its own hidden console:
+// waits for this app to exit, installs silently (Windows still asks for
+// admin permission), records the installer's exit code, then starts the app
+// again through Explorer, launching once more if it doesn't come up. Notes
+// go to update.log. Why it looks like this:
+// - Everything happens in-process (sleeps, the poll, stopping the app).
+//   Console tools would each need a console, which Windows Terminal shows
+//   as a flashing window, and a piped one can hang forever.
+// - Values arrive through BRB_* environment variables, so nothing is parsed
+//   as code and non-ASCII user folders are fine. It travels on a command
+//   line, so like the dialog it must not contain double quotes.
+// - PKG_EXECPATH is cleared. pkg hands it to child processes, and a pkg exe
+//   that inherits it starts as a bare Node REPL instead of the app.
+const APPLY_UPDATE_SCRIPT = "try { " + [
+  "[System.Net.WebRequest]::DefaultWebProxy = $null",
+  "Remove-Item Env:BRB_APPLY_SCRIPT -ErrorAction SilentlyContinue",
+  "$dir = $env:BRB_UPDATE_DIR",
+  "$ver = $env:BRB_UPDATE_VERSION",
+  "$log = Join-Path $dir 'update.log'",
+  // Writes fail while anything else has the file open, so retry briefly
+  "function Save($path, $text, $enc, [switch]$append) { for ($k = 0; $k -lt 10; $k++) { try { if ($append) { Add-Content -LiteralPath $path -Encoding $enc -Value $text -ErrorAction Stop } else { Set-Content -LiteralPath $path -Encoding $enc -Value $text -ErrorAction Stop }; return } catch { Start-Sleep -Milliseconds 100 } } }",
+  "function Note($m) { Save $log ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '  ' + $m) UTF8 -append }",
+  "Remove-Item Env:PKG_EXECPATH -ErrorAction SilentlyContinue",
+  "Note ('updating to v' + $ver)",
+  "Start-Sleep -Seconds 2",
+  "Get-Process -Id ([int]$env:BRB_APP_PID) -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $env:BRB_APP_EXE } | Stop-Process -Force -ErrorAction SilentlyContinue",
+  "Start-Sleep -Seconds 1",
+  "$installer = Join-Path $dir ('OBS-BRB-Shorts-Setup-' + $ver + '.exe')",
+  "$installerArgs = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', ('/LOG=' + [char]34 + (Join-Path $dir 'install.log') + [char]34))",
+  "$code = -1",
+  "try { $p = Start-Process -FilePath $installer -ArgumentList $installerArgs -Wait -PassThru -ErrorAction Stop; $code = $p.ExitCode } catch { Note ('installer did not start: ' + $_) }",
+  "Save (Join-Path $dir 'result.txt') ($ver + ' ' + $code) Ascii",
+  "Note ('installer exit code ' + $code)",
+  "Start-Sleep -Seconds 5",
+  "$up = $false",
+  "for ($attempt = 1; $attempt -le 2 -and -not $up; $attempt++) { " + [
+    "Note ('starting the app, attempt ' + $attempt)",
+    "Start-Process -FilePath (Join-Path $env:SystemRoot 'explorer.exe') -ArgumentList ([char]34 + $env:BRB_APP_EXE + [char]34)",
+    "for ($i = 0; $i -lt 6 -and -not $up; $i++) { Start-Sleep -Seconds 3; try { $r = Invoke-RestMethod -UseBasicParsing -TimeoutSec 2 -Uri ('http://127.0.0.1:' + $env:BRB_PORT + '/api/version'); if ($null -ne $r.current) { $up = $true } } catch {} }"
+  ].join("; ") + " }",
+  "Note ('app answering: ' + $up)",
+  "Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue"
+].join("; ") + " } catch { Note ('updater error: ' + $_) }";
+
+function installUpdate(release) {
+  console.log("");
+  console.log("  Downloading update v" + release.version + "...");
+  const installerPath = path.join(UPDATE_DIR, "OBS-BRB-Shorts-Setup-" + release.version + ".exe");
+  let expected = null;
+  Promise.resolve()
+    .then(function() {
+      prepareUpdateDir();
+      return expectedInstallerHash(release);
+    })
+    .then(function(hash) {
+      if (!hash) throw new Error("the release doesn't publish a SHA-256 for the installer");
+      expected = hash;
+      return withRetry("Download", function() {
+        return downloadFile(release.installer.browser_download_url, installerPath);
+      });
+    })
+    .then(function(actual) {
+      if (actual !== expected) {
+        throw new Error("the downloaded installer failed its SHA-256 check");
+      }
+      // The updater has to outlive this app, but Windows PowerShell won't run
+      // a script without a console (a detached spawn has none). So a
+      // short-lived PowerShell sharing this app's console starts the updater
+      // with its own hidden console, then exits. Node only kills its direct
+      // children when the app exits, so the updater carries on.
+      const relay = "Start-Process -FilePath $env:BRB_POWERSHELL -WindowStyle Hidden -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', $env:BRB_APPLY_SCRIPT)";
+      const child = childProcess.spawn(POWERSHELL, ["-NoProfile", "-NonInteractive", "-Command", relay], {
+        stdio: "ignore",
+        env: Object.assign({}, process.env, {
+          BRB_POWERSHELL: POWERSHELL,
+          BRB_APPLY_SCRIPT: APPLY_UPDATE_SCRIPT,
+          BRB_APP_EXE: process.execPath,
+          BRB_APP_PID: String(process.pid),
+          BRB_UPDATE_DIR: UPDATE_DIR,
+          BRB_UPDATE_VERSION: release.version,
+          BRB_PORT: String(PORT)
+        })
+      });
+      let settled = false;
+      function started(ok, why) {
+        if (settled) return;
+        settled = true;
+        if (!ok) {
+          console.log("  Couldn't start the installer (" + why + "). Nothing was changed.");
+          console.log("");
+          return;
+        }
+        console.log("  Update verified. This window will close now, Windows will ask for");
+        console.log("  permission in a few seconds, and the app will start again when it's done.");
+        setTimeout(function() { process.exit(0); }, 500);
+      }
+      child.on("error", function(err) { started(false, err.message); });
+      child.on("exit", function(code) { started(code === 0, "PowerShell exit code " + code); });
+    })
+    .catch(function(e) {
+      try { fs.unlinkSync(installerPath); } catch (err) {}
+      console.log("  Update failed: " + e.message);
+      console.log("  Nothing was changed. It will be offered again the next time the app starts.");
+      console.log("");
+    });
+}
+
+// Written by the updater script: "<version> <installer exit code>"
+function readLastUpdateResult() {
+  try {
+    const parts = fs.readFileSync(UPDATE_RESULT_FILE, "utf8").trim().split(/\s+/);
+    fs.unlinkSync(UPDATE_RESULT_FILE);
+    return { version: parts[0], code: Number(parts[1]) };
+  } catch (e) {
+    return null;
+  }
+}
+
+function startupUpdateCheck() {
+  const last = readLastUpdateResult();
+  if (last) {
+    if (compareVersions(VERSION, last.version) >= 0) {
+      console.log("  Updated to v" + VERSION + ".");
+    } else if (last.code === 0) {
+      console.log("  The installer for v" + last.version + " finished, but this copy is still v" + VERSION + ".");
+    } else {
+      console.log("  The update to v" + last.version + " wasn't installed (installer exit code " + last.code + ").");
+      console.log("  If you declined the Windows permission prompt, that's expected.");
+      console.log("  It will be offered again the next time the app starts.");
+    }
+    console.log("");
+  }
+
+  checkForUpdates().then(function(release) {
+    if (!release || !release.installer || !canSelfUpdate()) return;
+    // Don't re-prompt straight after a failed or declined install
+    if (last && compareVersions(VERSION, last.version) < 0) return;
+    if (process.env.OBS_BRB_SKIP_UPDATE_VERSION === release.version) {
+      console.log("  (Not showing the update prompt: you asked not to be reminded about v" + release.version + ".)");
+      console.log("");
+      return;
+    }
+    showUpdateDialog(release.version, function(choice) {
+      if (choice === "install") {
+        installUpdate(release);
+      } else if (choice === "skip") {
+        setUserEnv("OBS_BRB_SKIP_UPDATE_VERSION", release.version);
+        console.log("  OK, you won't be reminded about v" + release.version + " again.");
+        console.log("");
+      } else if (choice === null) {
+        console.log("  (Couldn't show the update prompt. Use the download link above.)");
+        console.log("");
+      }
+    });
+  });
+}
 
 // ====== SETUP WIZARD ======
 const setupHtml = `<!DOCTYPE html>
@@ -705,6 +1133,49 @@ app.get("/api/version", (req, res) => {
   });
 });
 
+// ====== PLAYER LOG ======
+// The player reports what it's doing. Important lines show in this console;
+// everything (including per-video state changes) is kept in memory and
+// served by GET /api/player-log, so it can be pasted into a bug report.
+const PLAYER_LOG_MAX = 500;
+const playerLog = [];
+const playerPages = new Map();   // page id -> where it connected from
+
+function localStamp() {
+  const d = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " +
+    pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+}
+
+app.post("/api/player-log", (req, res) => {
+  const page = String((req.body && req.body.page) || "").replace(/[^0-9a-z]/gi, "").slice(0, 8) || "?";
+  const lines = Array.isArray(req.body && req.body.lines) ? req.body.lines.slice(0, 50) : [];
+  if (!playerPages.has(page)) {
+    const ip = String(req.socket.remoteAddress || "").replace(/^::ffff:/, "");
+    const from = (ip === "127.0.0.1" || ip === "::1") ? "this computer" : (ip || "unknown");
+    if (playerPages.size >= 100) playerPages.delete(playerPages.keys().next().value);
+    playerPages.set(page, from);
+    playerLog.push(localStamp() + "  [" + page + "] player opened from " + from);
+    console.log("  [player " + page + "] opened from " + from);
+  }
+  for (const line of lines) {
+    const text = String(line && line.text != null ? line.text : line).replace(/[\r\n]+/g, " ").slice(0, 300);
+    const quiet = !!(line && line.quiet);
+    playerLog.push(localStamp() + "  [" + page + "] " + (quiet ? "  " : "") + text);
+    if (playerLog.length > PLAYER_LOG_MAX) playerLog.shift();
+    if (!quiet) console.log("  [player " + page + "] " + text);
+  }
+  res.json({ ok: true });
+});
+
+app.get("/api/player-log", (req, res) => {
+  res.type("text/plain").send(
+    "OBS BRB Shorts v" + VERSION + " player log (newest last; indented lines are detail)\n\n" +
+    playerLog.join("\n") + "\n"
+  );
+});
+
 // Shorts API
 app.get("/api/shorts", async (req, res) => {
   try {
@@ -1196,6 +1667,7 @@ const obsGuideHtml = `<!DOCTYPE html>
         <li>Try refreshing the browser source (right-click → Refresh)</li>
         <li>Verify your API key and Channel ID at <a href="/settings">/settings</a></li>
         <li>Config is stored in Windows environment variables — restart the app after changing settings</li>
+        <li>Open <a href="/api/player-log">/api/player-log</a> to see what the player has been doing. If you ask for help, include that page</li>
       </ul>
       
       <h3>"No Shorts Found"</h3>
@@ -1243,7 +1715,8 @@ const obsGuideHtml = `<!DOCTYPE html>
 
 // Network info API (for the guide page)
 app.get("/api/network-info", (req, res) => {
-  res.json({ localIP: getLocalIP() });
+  const ips = getLocalIPs();
+  res.json({ localIP: ips[0] || "YOUR_IP", otherIPs: ips.slice(1) });
 });
 
 // OBS Guide page
@@ -1323,8 +1796,11 @@ app.get("/settings", (req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   const localIP = getLocalIP();
   
-  // Check for updates on startup
-  checkForUpdates();
+  // Check for updates at startup (offering to install one), then every 6
+  // hours for the web banners. The app often runs for days, but the prompt
+  // only ever appears at launch so it can't pop up mid-stream.
+  setTimeout(startupUpdateCheck, 3000);
+  setInterval(checkForUpdates, 6 * 60 * 60 * 1000);
   
   console.log("");
   console.log("==========================================================");
@@ -1339,6 +1815,11 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log("  Use 'localhost' if OBS is on this computer.");
   console.log("  Use the IP address (" + localIP + ") to access from");
   console.log("  other computers on your local network.");
+  const otherIPs = getLocalIPs().slice(1);
+  if (otherIPs.length) {
+    console.log("  (If that address doesn't work from the other computer,");
+    console.log("   this PC also has: " + otherIPs.join(", ") + ")");
+  }
   console.log("");
   console.log("  SETUP & HELP:");
   console.log("  -----------------------------------------------------");
@@ -1474,6 +1955,101 @@ const playerHtml = `<!doctype html>
     let useTransition = false;
     let transitionVideo = null;
 
+    // State guards
+    let advancing = false;        // a transition-or-load cycle is in flight
+    let audioFixed = false;       // audio fix applied to the CURRENT video
+    let currentId = null;
+    let pendingLoad = false;      // next short deferred because OBS hid the source
+    let endTransition = null;     // cuts the transition in flight short, if any
+
+    // Stall watchdog: skip a short that makes no progress for STALL_MS
+    const STALL_MS = 30000;
+    let progressMark = 0;
+    let progressAt = Date.now();
+
+    // Loop guard: some embeds restart a Short from 0 when it ends instead
+    // of reporting ENDED (seen in OBS). A playhead that jumps back without
+    // one of our own seeks counts as the end of the video.
+    let wrapLastT = 0;
+    let lastSeekAt = 0;
+
+    // End timer: cut to the next short just before this one ends, so an
+    // embed that loops never gets the chance to show the restart. ENDED
+    // (where it does arrive) and the loop guard remain as backstops.
+    const END_LEAD_S = 0.4;
+    let endTimer = null;
+    function armEndTimer() {
+      clearTimeout(endTimer);
+      endTimer = null;
+      try {
+        const d = player.getDuration() || 0;
+        const t = player.getCurrentTime() || 0;
+        if (d < 1) return;
+        endTimer = setTimeout(function() {
+          endTimer = null;
+          if (advancing || document.hidden) return;
+          log("reached the end of", currentId, "(" + d.toFixed(1) + "s)");
+          advance("finished");
+        }, Math.max(0, (d - t - END_LEAD_S) * 1000));
+      } catch (e) {}
+    }
+    function disarmEndTimer() {
+      clearTimeout(endTimer);
+      endTimer = null;
+    }
+
+    function checkForLoop(t) {
+      if (advancing || !(wrapLastT > 3 && t < wrapLastT - 2) || Date.now() - lastSeekAt < 3000) return false;
+      log("video restarted itself at", wrapLastT, "without ending, treating that as the end:", currentId);
+      wrapLastT = 0;
+      advance("looped");
+      return true;
+    }
+
+    // Player log: log() lines show in the app's console window, trace()
+    // lines only go to /api/player-log. Both are batched to the server.
+    const pageId = Math.random().toString(36).slice(2, 6);
+    let logQueue = [];
+    let logTimer = null;
+    function fmtArgs(args) {
+      return Array.prototype.map.call(args, function(a) {
+        if (typeof a === "string") return a;
+        if (typeof a === "number") return Number.isInteger(a) ? String(a) : a.toFixed(2);
+        try { return JSON.stringify(a); } catch (e) { return String(a); }
+      }).join(" ");
+    }
+    function queueLog(quiet, args) {
+      const text = fmtArgs(args);
+      console.log("[brb]", text);
+      logQueue.push({ text: text, quiet: quiet });
+      if (logQueue.length > 200) logQueue.splice(0, logQueue.length - 200);
+      if (!logTimer) logTimer = setTimeout(flushLog, 300);
+    }
+    function log() { queueLog(false, arguments); }
+    function trace() { queueLog(true, arguments); }
+    function flushLog() {
+      logTimer = null;
+      const lines = logQueue;
+      logQueue = [];
+      try {
+        fetch("/api/player-log", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ page: pageId, lines: lines }),
+          keepalive: true
+        }).catch(function() {});
+      } catch (e) {}
+    }
+    function stateName(s) {
+      return { "-1": "UNSTARTED", "0": "ENDED", "1": "PLAYING", "2": "PAUSED", "3": "BUFFERING", "5": "CUED" }[String(s)] || String(s);
+    }
+    function playerInfo() {
+      try {
+        return "t=" + (player.getCurrentTime() || 0).toFixed(1) + " muted=" + player.isMuted() + " hidden=" + document.hidden + (advancing ? " advancing" : "") + (pendingLoad ? " pendingLoad" : "");
+      } catch (e) { return ""; }
+    }
+    trace("page loaded", "hidden=" + document.hidden, "ua=" + navigator.userAgent);
+
     const statusEl = document.getElementById('status');
     function showStatus(msg, duration) {
       duration = duration || 3000;
@@ -1499,8 +2075,7 @@ const playerHtml = `<!doctype html>
           useTransition = json.useTransition || false;
           if (useTransition) {
             transitionVideo = document.getElementById('transition-video');
-            // Preload the video
-            transitionVideo.load();
+            if (transitionVideo) { transitionVideo.load(); }
           }
         })
         .catch(function() {
@@ -1519,11 +2094,25 @@ const playerHtml = `<!doctype html>
           ids = json.ids || [];
           queue = shuffle(ids.slice());
           index = 0;
-          showStatus("Loaded " + ids.length + " shorts" + (json.cached ? " (cached)" : "") + (useTransition ? " + transitions" : ""));
+          if (ids.length) {
+            showStatus("Loaded " + ids.length + " shorts" + (json.cached ? " (cached)" : "") + (useTransition ? " + transitions" : ""));
+          } else {
+            showStatus("No shorts found! Check settings.", 10000);
+          }
         })
         .catch(function() {
           showStatus("Failed to load shorts", 5000);
         });
+    }
+
+    // Refresh the pool without disturbing the current playthrough
+    function refreshIds() {
+      return fetch("/api/shorts")
+        .then(function(resp) { return resp.json(); })
+        .then(function(json) {
+          if (json.ids && json.ids.length) { ids = json.ids; }
+        })
+        .catch(function() {});
     }
 
     function nextId() {
@@ -1532,135 +2121,272 @@ const playerHtml = `<!doctype html>
       if (index >= queue.length) {
         queue = shuffle(ids.slice());
         index = 0;
+        // Don't let a reshuffle play the same short twice in a row
+        if (queue.length > 1 && queue[0] === id) {
+          const j = 1 + Math.floor(Math.random() * (queue.length - 1));
+          queue[0] = queue[j];
+          queue[j] = id;
+        }
       }
       return id;
     }
 
-    function playTransitionThenNext() {
-      if (!useTransition || !transitionVideo) {
-        playNext();
+    // Load the next short. Only ever called from advance(), or to resume a
+    // load that was deferred while the source was hidden.
+    function loadNextVideo() {
+      // Never start a short while OBS has the source hidden. advancing stays
+      // true until the load actually happens.
+      if (document.hidden) {
+        pendingLoad = true;
+        log("source hidden, next short deferred");
         return;
       }
-      
-      // Show and play transition
-      transitionVideo.style.display = 'block';
-      transitionVideo.currentTime = 0;
-      transitionVideo.play().then(function() {
-        // When transition ends, hide it and play next short
-        transitionVideo.onended = function() {
-          transitionVideo.style.display = 'none';
-          playNext();
-        };
-      }).catch(function() {
-        // If transition fails, just play next
+      pendingLoad = false;
+      const id = nextId();
+      if (!id || !player) { advancing = false; return; }
+      currentId = id;
+      audioFixed = false;
+      progressMark = 0;
+      progressAt = Date.now();
+      wrapLastT = 0;
+      log("loading", id);
+      try {
+        player.loadVideoById({ videoId: id });
+      } catch (e) {
+        log("loadVideoById failed", String(e));
+      }
+      advancing = false;
+    }
+
+    // Single entry point for moving to the next short.
+    // Re-entrant calls are dropped, which is what stops a repeat loop.
+    function advance(reason) {
+      if (advancing) {
+        log("advance ignored (in flight), reason:", reason);
+        return;
+      }
+      advancing = true;
+      disarmEndTimer();
+      log("advance, reason:", reason, playerInfo());
+
+      if (!useTransition || !transitionVideo || document.hidden) {
+        loadNextVideo();
+        return;
+      }
+
+      // Pause the YouTube player so it cannot emit state changes
+      // while the transition is on screen.
+      try { player.pauseVideo(); } catch (e) {}
+
+      let done = false;
+      let ceiling = null;
+      function finish(how) {
+        if (done) return;
+        done = true;
+        endTransition = null;
+        clearTimeout(ceiling);
+        transitionVideo.onended = null;
+        transitionVideo.onerror = null;
         transitionVideo.style.display = 'none';
-        playNext();
+        try { transitionVideo.pause(); } catch (e) {}
+        log("transition finished:", how);
+        loadNextVideo();
+      }
+      endTransition = finish;
+
+      // Attach handlers BEFORE play() so a fast/short clip cannot
+      // fire 'ended' before we are listening.
+      transitionVideo.onended = function() { finish("ended"); };
+      transitionVideo.onerror = function() { finish("error"); };
+
+      transitionVideo.style.display = 'block';
+      try { transitionVideo.currentTime = 0; } catch (e) {}
+
+      // Hard ceiling: a stalled or missing transition.mp4 can never
+      // wedge the playlist.
+      ceiling = setTimeout(function() { finish("timeout"); }, 8000);
+
+      const p = transitionVideo.play();
+      if (p && typeof p.catch === "function") {
+        p.catch(function() { finish("play rejected"); });
+      }
+    }
+
+    // Audio fix, applied at most once per video. The player starts muted so
+    // autoplay is allowed; after unmuting, restart the short so its opening is
+    // heard. A short that starts unmuted is left alone: seeking it only causes
+    // a rebuffer stutter at the start.
+    function applyAudioFix() {
+      if (audioFixed) return;
+      audioFixed = true; // set first, so the seek's own PLAYING event is a no-op
+      try {
+        if (player.isMuted()) {
+          trace("audio fix: started muted, unmuting and restarting");
+          player.unMute();
+          player.setVolume(100);
+          lastSeekAt = Date.now();
+          player.seekTo(0, true);
+        } else {
+          trace("audio fix: started unmuted, nothing to do");
+        }
+      } catch (e) {}
+    }
+
+    function createPlayer() {
+      player = new YT.Player("player", {
+        width: "100%",
+        height: "100%",
+        playerVars: {
+          autoplay: 1,
+          controls: 0,
+          disablekb: 1,
+          fs: 0,
+          rel: 0,
+          modestbranding: 1,
+          iv_load_policy: 3,
+          playsinline: 1,
+          mute: 1
+        },
+        events: {
+          onReady: function() {
+            trace("player ready", "hidden=" + document.hidden, "transition=" + useTransition);
+            // Opening transition (if enabled), then the first short
+            advance("onReady");
+
+            // Recovery nudge and stall watchdog. The nudge never seeks or
+            // advances; the watchdog skips a short stuck for STALL_MS.
+            // Loop guard backstop, checked every second (the state-change
+            // handler usually catches a restart first)
+            setInterval(function() {
+              if (!player || advancing || document.hidden) { wrapLastT = 0; return; }
+              try {
+                if (player.getPlayerState() !== YT.PlayerState.PLAYING) return;
+                const t = player.getCurrentTime() || 0;
+                if (checkForLoop(t)) return;
+                wrapLastT = t;
+              } catch (e) {}
+            }, 1000);
+
+            let ticks = 0;
+            setInterval(function() {
+              ticks++;
+              if (ticks % 3 === 0) {
+                try { trace("heartbeat", currentId, "state=" + stateName(player.getPlayerState()), playerInfo()); } catch (e) {}
+              }
+              if (pendingLoad && !document.hidden) { loadNextVideo(); return; }
+              if (document.hidden || !player || advancing) {
+                progressAt = Date.now();
+                return;
+              }
+              try {
+                const t = player.getCurrentTime() || 0;
+                if (t < progressMark || t - progressMark >= 1) {
+                  progressMark = t;
+                  progressAt = Date.now();
+                } else if (Date.now() - progressAt > STALL_MS) {
+                  log("stalled at", t, "on", currentId, "state=" + stateName(player.getPlayerState()));
+                  advance("stalled");
+                  return;
+                }
+                const s = player.getPlayerState();
+                if (s === YT.PlayerState.PAUSED || s === YT.PlayerState.UNSTARTED) {
+                  player.playVideo();
+                }
+              } catch (e) {}
+            }, 5000);
+          },
+          onStateChange: function(e) {
+            trace(stateName(e.data), currentId, playerInfo());
+            // A restart shows up first as BUFFERING or PLAYING back near 0:00
+            if (e.data === YT.PlayerState.BUFFERING || e.data === YT.PlayerState.PLAYING) {
+              try { if (checkForLoop(player.getCurrentTime() || 0)) return; } catch (err) {}
+            }
+            if (e.data === YT.PlayerState.PLAYING) {
+              // A load that was already under way when OBS hid the source
+              if (document.hidden) {
+                pausedByHidden = true;
+                try { player.pauseVideo(); } catch (err) {}
+                return;
+              }
+              applyAudioFix();
+              // (re)armed on every PLAYING, so a seek or a rebuffer recomputes it
+              armEndTimer();
+            } else if (e.data === YT.PlayerState.ENDED) {
+              disarmEndTimer();
+              advance("ended");
+            } else {
+              disarmEndTimer();
+            }
+          },
+          onError: function(e) {
+            log("player error", e.data, "on", currentId);
+            advance("error " + e.data);
+          }
+        }
       });
     }
 
-    function playNext() {
-      const id = nextId();
-      if (!id || !player) return;
-      player.loadVideoById({ videoId: id, suggestedQuality: "hd1080" });
-    }
-
-    function tryUnmuteAndPlay() {
-      if (!player) return;
-      try {
-        if (player.isMuted()) {
-          player.unMute();
-          player.setVolume(100);
+    // Keep retrying (with backoff) until the pool loads, so a network hiccup
+    // at startup can't leave a dead black source.
+    let retryDelay = 30000;
+    function start() {
+      loadIds().then(function() {
+        if (!ids.length) {
+          log("no shorts loaded, retrying in", retryDelay / 1000, "s");
+          setTimeout(start, retryDelay);
+          retryDelay = Math.min(retryDelay * 2, 10 * 60 * 1000);
+          return;
         }
-        player.playVideo();
-      } catch(e) {}
+        createPlayer();
+      });
     }
 
     window.onYouTubeIframeAPIReady = function() {
       showStatus("Loading...");
-      loadConfig().then(function() {
-        return loadIds();
-      }).then(function() {
-        if (!ids.length) {
-          showStatus("No shorts found! Check settings.", 10000);
-          return;
-        }
-
-        player = new YT.Player("player", {
-          width: "100%",
-          height: "100%",
-          playerVars: {
-            autoplay: 1,
-            controls: 0,
-            disablekb: 1,
-            fs: 0,
-            rel: 0,
-            modestbranding: 1,
-            iv_load_policy: 3,
-            playsinline: 1,
-            mute: 1
-          },
-          events: {
-            onReady: function() {
-              // Play transition first if enabled, then first Short
-              if (useTransition && transitionVideo) {
-                transitionVideo.style.display = 'block';
-                transitionVideo.currentTime = 0;
-                transitionVideo.play().then(function() {
-                  transitionVideo.onended = function() {
-                    transitionVideo.style.display = 'none';
-                    playNext();
-                  };
-                }).catch(function() {
-                  transitionVideo.style.display = 'none';
-                  playNext();
-                });
-              } else {
-                playNext();
-              }
-            },
-            onStateChange: function(e) {
-              // When video starts playing for the first time, unmute and restart from beginning
-              if (e.data === YT.PlayerState.PLAYING) {
-                try {
-                  if (player.isMuted()) {
-                    player.unMute();
-                    player.setVolume(100);
-                    player.seekTo(0, true);
-                  }
-                } catch(err) {}
-              }
-              if (e.data === YT.PlayerState.ENDED) {
-                playTransitionThenNext();
-              }
-            },
-            onError: function(e) {
-              console.log("Player error:", e.data);
-              playNext();
-            }
-          }
-        });
-      });
+      loadConfig().then(start);
     };
 
+    // If the YouTube API script itself failed to load (no internet yet),
+    // reload the page and try again.
+    setTimeout(function() {
+      if (!window.YT || !window.YT.Player) {
+        log("YouTube API not loaded, reloading");
+        flushLog();
+        location.reload();
+      }
+    }, 30000);
+
     document.addEventListener("visibilitychange", function() {
+      trace("visibility:", document.hidden ? "hidden" : "visible", player ? playerInfo() : "(no player yet)");
       if (!player) return;
       if (document.hidden) {
         pausedByHidden = true;
         try { player.pauseVideo(); } catch(e) {}
-        if (transitionVideo) {
-          try { transitionVideo.pause(); } catch(e) {}
-        }
-      } else if (pausedByHidden) {
+        // Cut a transition short; the next short loads when the source is shown again
+        if (endTransition) { endTransition("hidden"); }
+      } else {
+        const resume = pausedByHidden;
         pausedByHidden = false;
-        tryUnmuteAndPlay();
+        if (pendingLoad) {
+          loadNextVideo();
+        } else if (resume && !advancing) {
+          try { player.playVideo(); } catch(e) {}
+          // A quick hide/show can leave the player paused, so check again
+          setTimeout(function() {
+            if (document.hidden || advancing || !player) return;
+            try {
+              if (player.getPlayerState() === YT.PlayerState.PAUSED) { player.playVideo(); }
+            } catch(e) {}
+          }, 1000);
+        }
       }
     });
 
-    // Refresh shorts list every hour
+    // Refresh the shorts pool hourly, without resetting playback position
     setInterval(function() {
-      loadIds().catch(function() {});
+      refreshIds();
     }, 60 * 60 * 1000);
-    
+
     // Check for updates
     fetch('/api/version')
       .then(function(r) { return r.json(); })
